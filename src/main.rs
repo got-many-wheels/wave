@@ -1,5 +1,11 @@
 use std::{error, fs, str::Utf8Error};
 
+use sdl2::audio::{AudioQueue, AudioSpecDesired};
+use sdl2::event::Event;
+use sdl2::keyboard::Keycode;
+use sdl2::pixels::Color;
+use std::time::Duration;
+
 // http://soundfile.sapp.org/doc/WaveFormat/
 
 #[derive(Default, Debug)]
@@ -32,7 +38,7 @@ struct WAVFile {
     // copy of subchunk2_size
     data_size: u32,
     // pointer to data
-    data: Box<[u8]>,
+    data: Box<[i16]>,
 }
 
 impl WAVFile {
@@ -55,10 +61,24 @@ impl WAVFile {
         self.header.subchunk2_id = bytes_to_boxed_str(data).unwrap();
 
         let data_size = little_to_big_u32(data);
-        self.header.subchunk2_size = data_size;
         self.data_size = data_size;
-        self.data = data[0..].into();
-        data.drain(0..self.data.len());
+        self.header.subchunk2_size = data_size;
+
+        if data.len() < data_size as usize {
+            return Err("unexpected end of file".into());
+        }
+
+        let raw = data.drain(..data_size as usize).collect::<Vec<u8>>();
+
+        // since the buffer we are reading is represented as Vec<u8> we had to convert the audio
+        // data to Vec<i16> by combining two elements of idx 0 u8 & 1 u8 to be a single i16
+        let mut pcm_data = Vec::with_capacity(raw.len() / 2);
+        for chunk in raw.chunks_exact(2) {
+            let sample_le = i16::from_le_bytes([chunk[0], chunk[1]]);
+            pcm_data.push(sample_le);
+        }
+
+        self.data = pcm_data.into_boxed_slice();
 
         Ok(())
     }
@@ -83,15 +103,59 @@ fn bytes_to_boxed_str(data: &mut Vec<u8>) -> Result<Box<str>, Utf8Error> {
     let bytes = data[0..4].to_vec();
     let s = std::str::from_utf8(&bytes)?;
     data.drain(0..4);
-    Ok(s.into()) // Convert &str to Box<str>
+    Ok(s.into())
 }
 
 fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     let mut wav = WAVFile::new();
-    let mut data: Vec<u8> = fs::read("./file_example_WAV_5MG.wav")?;
-
+    let mut data = fs::read("file_example_WAV_5MG.wav")?;
     let _ = wav.parse(&mut data).unwrap();
-    println!("{:?}", wav.header);
+
+    let sdl_context = sdl2::init().unwrap();
+
+    let audio_subsystem = sdl_context.audio().unwrap();
+    let desired_spec = AudioSpecDesired {
+        freq: Some(wav.header.sample_rate as i32),
+        channels: Some(wav.header.num_channels as u8),
+        samples: None,
+    };
+
+    let device: AudioQueue<i16> = audio_subsystem.open_queue(None, &desired_spec)?;
+    let _ = device.queue_audio(&wav.data);
+
+    let video_subsystem = sdl_context.video().unwrap();
+    let window = video_subsystem
+        .window("wave", 800, 600)
+        .position_centered()
+        .build()
+        .unwrap();
+
+    let mut canvas = window.into_canvas().build().unwrap();
+
+    canvas.set_draw_color(Color::RGB(0, 255, 255));
+    canvas.clear();
+    canvas.present();
+    let mut event_pump = sdl_context.event_pump().unwrap();
+    let mut i = 0;
+    device.resume();
+    'running: loop {
+        i = (i + 1) % 255;
+        canvas.set_draw_color(Color::RGB(i, 64, 255 - i));
+        canvas.clear();
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => break 'running,
+                _ => {}
+            }
+        }
+
+        canvas.present();
+        ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));
+    }
 
     Ok(())
 }
