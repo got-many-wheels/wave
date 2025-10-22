@@ -1,6 +1,7 @@
+use std::sync::{Arc, Mutex};
 use std::{error, fs, str::Utf8Error};
 
-use sdl2::audio::{AudioQueue, AudioSpecDesired};
+use sdl2::audio::{AudioCallback, AudioSpecDesired};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::Color;
@@ -69,7 +70,6 @@ impl WAVFile {
         }
 
         let raw = data.drain(..data_size as usize).collect::<Vec<u8>>();
-
         // since the buffer we are reading is represented as Vec<u8> we had to convert the audio
         // data to Vec<i16> by combining two elements of idx 0 u8 & 1 u8 to be a single i16
         let mut pcm_data = Vec::with_capacity(raw.len() / 2);
@@ -79,7 +79,6 @@ impl WAVFile {
         }
 
         self.data = pcm_data.into_boxed_slice();
-
         Ok(())
     }
 }
@@ -106,6 +105,30 @@ fn bytes_to_boxed_str(data: &mut Vec<u8>) -> Result<Box<str>, Utf8Error> {
     Ok(s.into())
 }
 
+struct AudioPlayer {
+    data: Arc<[i16]>,
+    position: usize,
+    shared_position: Arc<Mutex<usize>>,
+}
+
+impl AudioCallback for AudioPlayer {
+    type Channel = i16;
+
+    fn callback(&mut self, out: &mut [i16]) {
+        for sample in out.iter_mut() {
+            *sample = if self.position < self.data.len() {
+                self.data[self.position]
+            } else {
+                0
+            };
+            self.position += 1;
+        }
+
+        // Update shared position for rendering
+        *self.shared_position.lock().unwrap() = self.position;
+    }
+}
+
 fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     let mut wav = WAVFile::new();
     let mut data = fs::read("file_example_WAV_5MG.wav")?;
@@ -113,15 +136,23 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
 
     let sdl_context = sdl2::init().unwrap();
 
-    let audio_subsystem = sdl_context.audio().unwrap();
+    let shared_position = Arc::new(Mutex::new(0));
+    let player = AudioPlayer {
+        data: wav.data.clone().into(),
+        position: 0,
+        shared_position: shared_position.clone(),
+    };
     let desired_spec = AudioSpecDesired {
         freq: Some(wav.header.sample_rate as i32),
         channels: Some(wav.header.num_channels as u8),
-        samples: None,
+        samples: Some(wav.header.bits_per_sample),
     };
 
-    let device: AudioQueue<i16> = audio_subsystem.open_queue(None, &desired_spec)?;
-    let _ = device.queue_audio(&wav.data);
+    let audio_subsystem = sdl_context.audio().unwrap();
+
+    // use callback since we want to syncronize the samples position in the audio buffer
+    let device = audio_subsystem.open_playback(None, &desired_spec, |_spec| player)?;
+    device.resume();
 
     let video_subsystem = sdl_context.video().unwrap();
     let window = video_subsystem
@@ -136,12 +167,14 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     canvas.clear();
     canvas.present();
     let mut event_pump = sdl_context.event_pump().unwrap();
-    let mut i = 0;
     device.resume();
+
     'running: loop {
-        i = (i + 1) % 255;
-        canvas.set_draw_color(Color::RGB(i, 64, 255 - i));
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
         canvas.clear();
+        let played_samples = *shared_position.lock().unwrap();
+        draw_waveform(&mut canvas, &wav, played_samples);
+
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. }
@@ -156,6 +189,37 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
         canvas.present();
         ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));
     }
-
     Ok(())
+}
+
+fn draw_waveform(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    wav: &WAVFile,
+    played_samples: usize,
+) {
+    let (width, height) = canvas.output_size().unwrap();
+    let samples_to_display = 4096;
+
+    let start = played_samples;
+    let end = (start + samples_to_display).min(wav.data.len());
+
+    if start >= wav.data.len() {
+        return;
+    }
+
+    let chunk = &wav.data[start..end];
+
+    canvas.set_draw_color(Color::RGB(0, 255, 0));
+
+    let center_y = height as i32 / 2;
+
+    for i in 0..chunk.len().saturating_sub(1) {
+        let x1 = (i as f32 / samples_to_display as f32 * width as f32) as i32;
+        let x2 = ((i + 1) as f32 / samples_to_display as f32 * width as f32) as i32;
+
+        let y1 = center_y - (chunk[i] as i32 * height as i32 / 2 / 32768);
+        let y2 = center_y - (chunk[i + 1] as i32 * height as i32 / 2 / 32768);
+
+        canvas.draw_line((x1, y1), (x2, y2)).ok();
+    }
 }
